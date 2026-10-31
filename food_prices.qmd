@@ -1,0 +1,277 @@
+---
+title: "Food prices in North-East Nigeria after the naira float"
+author: "Olorunmaiye Peter"
+format:
+  html:
+    embed-resources: true
+    toc: true
+    code-fold: true
+    theme: flatly
+execute:
+  warning: false
+  message: false
+---
+
+## Business question
+
+In June 2023 Nigeria let the naira float, and by 2024 a dollar cost more than three times as many naira. **How much did staple food prices rise in North-East Nigeria, did they follow the currency, and where do they stand now?**
+
+This is mainly a **data cleaning** project. The World Food Programme's market price data is detailed but messy: prices are recorded for many different pack sizes, the recording method changes over time, and most of the country stops being monitored in 2023. The report shows each cleaning step, then answers the question with the cleaned data, which is also saved as a reusable file.
+
+**Data:** World Food Programme market monitoring, Nigeria food prices, via the Humanitarian Data Exchange (HDX).
+
+## 1. Setup
+
+```{r setup}
+library(tidyverse)   # readr, dplyr, tidyr, stringr, lubridate, ggplot2
+
+dir.create("charts", showWarnings = FALSE)
+dir.create("data/clean", showWarnings = FALSE, recursive = TRUE)
+
+orange <- "#e8603c"
+navy   <- "#13263f"
+grey   <- "#c9ced6"
+theme_set(theme_minimal(base_size = 12))
+
+end_date <- as_date("2026-08-31")   # last complete month when this analysis was done
+```
+
+## 2. Import
+
+Everything is read as text first. HDX files can carry a second header row of "HXL" tags (such as `#date`), which would otherwise turn every column into text; it is removed before the columns are converted to dates and numbers.
+
+```{r import}
+raw <- read_csv("data/raw/wfp_food_prices_nga.csv",
+                col_types = cols(.default = col_character()))
+
+hxl_rows <- raw |> filter(str_starts(date, "#"))
+cat("HXL tag rows removed:", nrow(hxl_rows), "\n")
+
+prices <- raw |>
+  filter(!str_starts(date, "#")) |>
+  type_convert() |>
+  mutate(date = as_date(date))
+
+cat("Rows:", nrow(prices), " Columns:", ncol(prices),
+    " Dates:", format(min(prices$date)), "to", format(max(prices$date)), "\n")
+glimpse(prices)
+```
+
+## 3. Inspect
+
+```{r inspect}
+# Duplicates: one price per market, food, pack size, price type and flag per date?
+prices |>
+  count(date, market, commodity, unit, pricetype, priceflag) |>
+  filter(n > 1) |>
+  nrow()
+
+prices |> count(pricetype)
+prices |> count(unit, sort = TRUE) |> print(n = Inf)
+
+# The recording method changes over time: "actual" prices until 2023, then "aggregate"
+prices |>
+  count(year = year(date), priceflag) |>
+  pivot_wider(names_from = priceflag, values_from = n, values_fill = 0) |>
+  filter(year >= 2015)
+```
+
+**Check:** no duplicates; 20 different units, from `100 KG` sacks to `400 G` tins and `30 pcs` of eggs. The flags change from "actual" to "aggregate" around 2020 to 2024. They never overlap for the same price, so they are a change in recording method, not duplicate records, and both are kept.
+
+### Where and when are prices recorded?
+
+```{r coverage, fig.width = 9, fig.height = 5}
+prices |>
+  group_by(state = admin1) |>
+  summarise(first = min(date), last = max(date), records = n()) |>
+  arrange(desc(last))
+
+coverage <- prices |>
+  filter(year(date) >= 2015, date <= end_date) |>
+  count(state = admin1, year = year(date))
+
+p_cov <- ggplot(coverage, aes(x = year, y = fct_reorder(state, n, sum), fill = n)) +
+  geom_tile(colour = "white", linewidth = 0.6) +
+  scale_fill_gradient(low = "#fbe3da", high = orange, name = "Price records") +
+  scale_x_continuous(breaks = 2015:2026) +
+  labs(title = "Most states stop being monitored in January 2023",
+       subtitle = "Number of WFP food price records by state and year",
+       x = NULL, y = NULL,
+       caption = "Source: World Food Programme via HDX") +
+  theme(panel.grid = element_blank())
+p_cov
+ggsave("charts/coverage.png", p_cov, width = 9, height = 5, dpi = 150, bg = "white")
+```
+
+Only the three North-East states (Borno, Yobe and Adamawa) are monitored after January 2023, so the rest of the analysis uses those three. The results describe the North-East, not Nigeria as a whole.
+
+## 4. Clean
+
+### Keep retail prices in the North-East, 2019 to August 2026
+
+```{r filter}
+ne <- prices |>
+  filter(admin1 %in% c("Borno", "Yobe", "Adamawa"),
+         pricetype == "Retail",
+         date >= as_date("2019-01-01"),
+         date <= end_date)
+
+cat("Records:", nrow(ne), " Markets:", n_distinct(ne$market),
+    " Foods:", n_distinct(ne$commodity), "\n")
+```
+
+### Convert every price to a price per kg, litre or piece
+
+Each food is sold in its own local measure: millet by the 2.6 kg bowl, rice by the 2.7 kg bowl, salt by the 250 g packet. Prices can only be compared once each is divided by its quantity.
+
+```{r units}
+ne <- ne |>
+  mutate(pack_size = as.numeric(str_extract(unit, "^[0-9.]+")),
+         pack_size = replace_na(pack_size, 1),          # "KG", "L", "Unit" mean one
+         unit_base = str_extract(unit, "[A-Za-z]+$"),
+         quantity  = if_else(unit_base == "G", pack_size / 1000, pack_size),
+         per       = case_match(unit_base,
+                                c("KG", "G") ~ "kg",
+                                "L" ~ "litre",
+                                c("pcs", "Tubers", "Unit") ~ "piece"),
+         price_per_unit = price / quantity)
+
+ne |> count(per)
+
+# Spot check: a few foods before and after
+ne |>
+  filter(date == as_date("2026-08-15"), market == first(market)) |>
+  select(commodity, unit, price, quantity, per, price_per_unit) |>
+  head(8)
+```
+
+### Work out the exchange rate from the data
+
+Every price is given in naira and in US dollars, so their ratio is the exchange rate WFP used that month.
+
+```{r fx}
+ne <- ne |> mutate(ngn_per_usd = price / usdprice,
+                   month = floor_date(date, "month"))
+```
+
+### Flag implausible prices
+
+A price more than 5 times, or less than a fifth of, the median for the same food in the same month is most likely a recording error. These rows are flagged and left out of the medians, not deleted.
+
+```{r outliers}
+ne <- ne |>
+  group_by(commodity, month) |>
+  mutate(ratio_to_median = price_per_unit / median(price_per_unit),
+         outlier = ratio_to_median > 5 | ratio_to_median < 0.2) |>
+  ungroup()
+
+ne |> summarise(outliers = sum(outlier), pct = round(100 * mean(outlier), 2))
+ne |> filter(outlier) |> count(commodity, sort = TRUE) |> head(6)
+```
+
+### Save the clean dataset
+
+```{r save}
+clean <- ne |>
+  transmute(date, month, state = admin1, lga = admin2, market,
+            category, commodity, unit_recorded = unit, quantity, per,
+            price_ngn = price, price_per_unit_ngn = round(price_per_unit, 2),
+            price_usd = usdprice, ngn_per_usd = round(ngn_per_usd, 2),
+            price_flag = priceflag, outlier)
+
+write_csv(clean, "data/clean/ne_retail_prices_clean.csv")
+cat("Saved", nrow(clean), "rows to data/clean/ne_retail_prices_clean.csv\n")
+```
+
+## 5. Analyse: staple prices against the naira
+
+Five staples bought by most households: local rice, maize flour, millet, sorghum and white beans. For each, the monthly median price per kg across North-East markets is set to 100 for February to May 2023, the four months before the float. The basket is the average of the five.
+
+```{r index}
+staples <- c("Rice (local)", "Maize flour", "Millet", "Sorghum", "Beans (white)")
+
+monthly <- clean |>
+  filter(!outlier, commodity %in% staples) |>
+  group_by(month, commodity) |>
+  summarise(price = median(price_per_unit_ngn), .groups = "drop")
+
+base <- monthly |>
+  filter(month >= as_date("2023-02-01"), month <= as_date("2023-05-01")) |>
+  group_by(commodity) |>
+  summarise(base_price = mean(price))
+base |> mutate(base_price = round(base_price, 1))
+
+index <- monthly |>
+  left_join(base, by = "commodity") |>
+  mutate(index = 100 * price / base_price)
+
+basket <- index |>
+  group_by(month) |>
+  summarise(basket = mean(index), staples = n(), .groups = "drop") |>
+  filter(staples == 5)
+
+fx <- clean |>
+  filter(!outlier) |>
+  group_by(month) |>
+  summarise(ngn_per_usd = median(ngn_per_usd))
+fx_base <- fx |> filter(month >= as_date("2023-02-01"), month <= as_date("2023-05-01")) |>
+  summarise(mean(ngn_per_usd)) |> pull()
+
+trend <- basket |>
+  left_join(fx, by = "month") |>
+  mutate(naira_index = 100 * ngn_per_usd / fx_base,
+         basket_in_dollars = 100 * basket / naira_index) |>
+  filter(month >= as_date("2023-02-01"))
+
+trend |>
+  filter(month %in% as_date(c("2023-05-01", "2023-08-01", "2024-01-01", "2024-09-01",
+                              "2025-06-01", "2026-01-01", "2026-08-01"))) |>
+  mutate(across(where(is.numeric), round))
+```
+
+```{r plot-trend, fig.width = 9, fig.height = 5}
+trend_long <- trend |>
+  select(month, `Staple food basket` = basket, `Naira per US dollar` = naira_index) |>
+  pivot_longer(-month, names_to = "series", values_to = "index")
+
+p_trend <- ggplot(trend_long, aes(x = month, y = index, colour = series)) +
+  geom_hline(yintercept = 100, colour = grey) +
+  geom_vline(xintercept = as_date("2023-06-14"), linetype = "dashed", colour = grey) +
+  annotate("text", x = as_date("2023-06-20"), y = 420, label = "Naira floated\nJune 2023",
+           hjust = 0, size = 3.3, colour = "grey40") +
+  geom_line(linewidth = 1.1) +
+  scale_colour_manual(values = c(`Staple food basket` = orange, `Naira per US dollar` = navy)) +
+  scale_x_date(date_breaks = "6 months", date_labels = "%b %Y") +
+  labs(title = "Food prices overshot the currency, then fell back below it",
+       subtitle = "Index, February to May 2023 = 100. North-East Nigeria, retail markets",
+       x = NULL, y = "Index", colour = NULL,
+       caption = "Basket: median price per kg of local rice, maize flour, millet, sorghum and white beans.\nSource: World Food Programme via HDX") +
+  theme(legend.position = "top")
+p_trend
+ggsave("charts/basket_vs_naira.png", p_trend, width = 9, height = 5, dpi = 150, bg = "white")
+```
+
+```{r plot-staples, fig.width = 9, fig.height = 6}
+p_staples <- index |>
+  filter(month >= as_date("2023-02-01")) |>
+  ggplot(aes(x = month, y = index)) +
+  geom_hline(yintercept = 100, colour = grey) +
+  geom_line(colour = orange, linewidth = 0.9) +
+  facet_wrap(~ commodity, ncol = 3) +
+  scale_x_date(date_breaks = "1 year", date_labels = "%Y") +
+  labs(title = "Every staple peaked in 2024; beans and maize flour rose most",
+       subtitle = "Median retail price per kg, index February to May 2023 = 100",
+       x = NULL, y = "Index",
+       caption = "Source: World Food Programme via HDX")
+p_staples
+ggsave("charts/staples.png", p_staples, width = 9, height = 6, dpi = 150, bg = "white")
+```
+
+Staple prices in North-East Nigeria rose much faster than the currency fell. With February to May 2023 set to 100, the basket of local rice, maize flour, millet, sorghum and white beans reached 394 in September 2024, almost four times its pre-float level, while the naira price of a dollar reached 354. Beans (535) and maize flour (476) rose most, local rice least (259). Prices then fell sharply: by January 2026 the basket was back to 144, while a dollar still cost 3.1 times as many naira (310), so in dollar terms food cost less than half (46) of what it did before the float. Prices have risen again since, to 214 in August 2026. For families earning in naira, food still costs twice what it did in early 2023; for aid agencies buying with dollars, it is cheaper than before the float.
+
+## 6. Limitations
+
+- Only Borno, Yobe and Adamawa are monitored after January 2023, so the results describe the North-East, not Nigeria; the region is also affected by conflict, which raises prices for its own reasons.
+- The number of markets reporting changes from month to month (5 to 38), so part of the month-to-month movement comes from which markets reported.
+- The exchange rate is the one WFP used to convert each price, which may differ from the official or parallel market rate on a given day.
+- Medians describe a typical market; prices in individual markets can differ widely.
